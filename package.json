@@ -1,0 +1,36 @@
+{
+  "name": "inventory-management-agent",
+  "version": "1.0.0",
+  "description": "AI-powered inventory management using Daemo and Google Sheets",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "daemo",
+    "inventory",
+    "google-sheets",
+    "ai-agent"
+  ],
+  "ts-node": {
+    "esm": true
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "daemo-engine": "^0.2.4",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "googleapis": "^144.0.0",
+    "reflect-metadata": "^0.2.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.10.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}
