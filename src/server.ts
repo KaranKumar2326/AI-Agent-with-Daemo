@@ -3,6 +3,7 @@ import bodyParser from "body-parser";
 import agentController from "./controller/agentController";
 
 const app = express();
+const PORT = process.env.PORT || 4000;
 
 app.use(bodyParser.json());
 
@@ -10,6 +11,6 @@ app.use(bodyParser.json());
 app.post("/agent/query", agentController.processQuery);
 app.post("/agent/query-stream", agentController.processQueryStreamed);
 
-app.listen(4000, () => {
-  console.log("🚀 API running at http://localhost:4000");
+app.listen(PORT, () => {
+  console.log(`🚀 API running on port ${PORT}`);
 });
