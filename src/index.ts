@@ -1,7 +1,7 @@
 import "dotenv/config";
-
-import { initDaemo } from "./services/daemoService";
 import "./server";
+import { initDaemo } from "./services/daemoService";
+
 
 async function main() {
   await initDaemo();
