@@ -16,6 +16,6 @@ export const config = {
     "engine.daemo.ai:50052",
   google: {
     sheetId: required("GOOGLE_SHEET_ID"),
-    keyFile: required("GOOGLE_KEY_FILE"),
+    keyBase64: required("GOOGLE_KEY_BASE64"),
   },
 };

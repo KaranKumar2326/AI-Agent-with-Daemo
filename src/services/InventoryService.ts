@@ -3,6 +3,19 @@ import { DaemoFunction, DaemoSchema } from "daemo-engine";
 import { z } from "zod";
 import { config } from "../config";
 
+
+import fs from "fs";
+import path from "path";
+
+const keyBase64 = config.google.keyBase64;
+
+const keyJson = Buffer.from(keyBase64, "base64").toString("utf-8");
+
+const keyPath = path.join(process.cwd(), "google-key.json");
+
+fs.writeFileSync(keyPath, keyJson);
+
+
 /* ===============================
    Schema
 ================================ */
@@ -69,7 +82,7 @@ export class InventoryService {
 
   private async getSheet() {
     const auth = new google.auth.GoogleAuth({
-      keyFile: config.google.keyFile,
+      keyFile: keyPath,
       scopes: ["https://www.googleapis.com/auth/spreadsheets"],
     });
 
