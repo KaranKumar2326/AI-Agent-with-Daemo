@@ -65,6 +65,7 @@ Amount: ${normalized.amount ?? "none"}`;
     const result = await client.processQuery(query, {
       threadId: thread_id,
       sessionId: session.ServiceName,
+      llmConfig: buildLlmConfig(max_tokens),
       contextJson: context
         ? JSON.stringify(context)
         : undefined,
@@ -91,7 +92,7 @@ const processQueryStreamed = (req: Request, res: Response) => {
   if (!query) {
     return res.status(400).json({ error: "Query required" });
   }
-  
+
   const normalized = normalizeQuery(query);
 
   console.log("NORMALIZED:", normalized);
