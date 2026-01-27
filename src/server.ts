@@ -1,9 +1,17 @@
 import express from "express";
 import bodyParser from "body-parser";
 import agentController from "./controller/agentController";
-
+import cors from "cors";
 const app = express();
 const PORT = process.env.PORT || 4000;
+
+app.use(
+  cors({
+    origin: "*", // allow all (for now)
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 
 app.use(bodyParser.json());
 
