@@ -9,10 +9,14 @@ import { InventoryService } from "./InventoryService";
 import { config } from "../config";
 
 let sessionData: SessionData | null = null;
-
+let isConnected = false;
 
 export async function initDaemo() {
   console.log("🔌 Initializing Daemo...");
+  if (isConnected) {
+    console.log("⚠️ Daemo already connected");
+    return;
+  }
 
   const inventoryService = new InventoryService();
 
@@ -247,8 +251,10 @@ You are a stateless function executor. Each user message is treated as completel
 
   try {
     await connection.start();
+    isConnected = true;
     console.log("✅ Daemo Connected");
   } catch (err) {
+    isConnected = false;
     console.error("❌ Daemo Connection Failed:", err);
     throw err;
   }

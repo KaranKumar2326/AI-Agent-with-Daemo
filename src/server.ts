@@ -2,6 +2,9 @@ import express from "express";
 import bodyParser from "body-parser";
 import agentController from "./controller/agentController";
 import cors from "cors";
+import { initDaemo } from "./services/daemoService";
+
+
 const app = express();
 const PORT = process.env.PORT || 4000;
 
@@ -13,16 +16,36 @@ app.use(
   })
 );
 
+app.use(async (req, res, next) => {
+  try {
+    await initDaemo();
+  } catch (err) {
+    console.error("Daemon reconnect failed");
+  }
+
+  next();
+});
+
 app.use(bodyParser.json());
 
 // API Routes
-app.get("/", (req, res) => {
-  res.status(200).json({
-    status: "ok",
-    message: "Inventory Agent is running",
-    time: new Date().toISOString(),
-  });
+app.get("/", async (req, res) => {
+  try {
+    await initDaemo();
+
+    res.status(200).json({
+      status: "ok",
+      daemo: "connected",
+      time: new Date().toISOString(),
+    });
+  } catch {
+    res.status(500).json({
+      status: "error",
+      daemo: "disconnected",
+    });
+  }
 });
+
 app.post("/agent/query", agentController.processQuery);
 app.post("/agent/query-stream", agentController.processQueryStreamed);
 
