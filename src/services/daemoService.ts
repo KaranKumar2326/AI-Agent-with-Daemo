@@ -9,20 +9,33 @@ import { InventoryService } from "./InventoryService";
 import { config } from "../config";
 
 let sessionData: SessionData | null = null;
-let isConnected = false;
+let connection: DaemoHostedConnection | null = null;
 
+let connecting = false;
+
+/**
+ * Initialize / Reconnect Daemo
+ */
 export async function initDaemo() {
-  console.log("🔌 Initializing Daemo...");
-  if (isConnected) {
-    console.log("⚠️ Daemo already connected");
+  if (connecting) {
+    console.log("⏳ Daemo connection in progress...");
     return;
   }
 
-  const inventoryService = new InventoryService();
+  if (connection) {
+    return;
+  }
 
-  const session = new DaemoBuilder()
-    .withServiceName("inventory_manager")
-    .withSystemPrompt(`
+  connecting = true;
+
+  console.log("🔌 Initializing Daemo...");
+
+  try {
+    const inventoryService = new InventoryService();
+
+    const session = new DaemoBuilder()
+      .withServiceName("inventory_manager")
+      .withSystemPrompt(`
 You are a precise inventory management assistant with access to real-time inventory data through tools.
 
 ====================
@@ -238,30 +251,47 @@ Every response MUST follow this sequence:
 
 You are a stateless function executor. Each user message is treated as completely independent.
 `)
-    .registerService(inventoryService)
-    .build();
+      .registerService(inventoryService)
+      .build();
 
-  const connection = new DaemoHostedConnection(
-    {
-      agentApiKey: config.daemoKey,
-      daemoGatewayUrl: config.daemoGatewayUrl,
-    },
-    session
-  );
+    connection = new DaemoHostedConnection(
+      {
+        agentApiKey: config.daemoKey,
+        daemoGatewayUrl: config.daemoGatewayUrl,
+      },
+      session
+    );
 
-  try {
     await connection.start();
-    isConnected = true;
+
+    sessionData = session;
+
     console.log("✅ Daemo Connected");
   } catch (err) {
-    isConnected = false;
     console.error("❌ Daemo Connection Failed:", err);
-    throw err;
-  }
 
-  sessionData = session;
+    connection = null;
+    sessionData = null;
+
+    throw err;
+  } finally {
+    connecting = false;
+  }
 }
 
+/**
+ * Reset Dead Connection
+ */
+export function resetDaemo() {
+  console.warn("🔄 Resetting Daemo connection");
+
+  connection = null;
+  sessionData = null;
+}
+
+/**
+ * Get Active Session
+ */
 export function getSessionData() {
   return sessionData;
 }

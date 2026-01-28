@@ -47,9 +47,9 @@ export default function App() {
     try {
       // Using published CSV format (works if sheet is published to web)
       const csvUrl = `https://docs.google.com/spreadsheets/d/${GOOGLE_SHEET_ID}/export?format=csv&gid=0`;
-      
+
       const response = await fetch(csvUrl);
-      
+
       if (!response.ok) {
         throw new Error("Failed to fetch sheet data. Make sure the sheet is published to the web (File → Share → Publish to web).");
       }
@@ -60,10 +60,10 @@ export default function App() {
         const values: string[] = [];
         let current = "";
         let inQuotes = false;
-        
+
         for (let i = 0; i < row.length; i++) {
           const char = row[i];
-          
+
           if (char === '"') {
             inQuotes = !inQuotes;
           } else if (char === "," && !inQuotes) {
@@ -74,7 +74,7 @@ export default function App() {
           }
         }
         values.push(current.trim());
-        
+
         return values;
       });
 
@@ -100,25 +100,79 @@ export default function App() {
 
 
   async function wakeServer() {
-  try {
-    setServerStatus("checking");
+    try {
+      setServerStatus("checking");
 
-    const res = await fetch(`${BACKEND_URL}/`);
+      const res = await fetch(`${BACKEND_URL}/`);
 
-    if (!res.ok) {
-      throw new Error("Server not responding");
+      if (!res.ok) {
+        throw new Error("Server not responding");
+      }
+
+      const data = await res.json();
+
+      console.log("✅ Server health:", data);
+
+      setServerStatus("online");
+    } catch (err) {
+      console.error("❌ Wake failed:", err);
+      setServerStatus("offline");
+    }
+  }
+
+  function parseDaemoResponse(data: any) {
+    let text = "";
+    let table: any[] | null = null;
+
+    // 1️⃣ Text response
+    if (data?.text) {
+      text = data.text;
     }
 
-    const data = await res.json();
+    // 2️⃣ JSX fallback
+    else if (data?.jsx) {
+      text = "📊 Data loaded. See table below.";
+    }
 
-    console.log("✅ Server health:", data);
+    // 3️⃣ Tool interactions
+    if (Array.isArray(data?.toolInteractions)) {
+      for (const tool of data.toolInteractions) {
+        const stored = tool?.result?.stored;
 
-    setServerStatus("online");
-  } catch (err) {
-    console.error("❌ Wake failed:", err);
-    setServerStatus("offline");
+        if (!Array.isArray(stored)) continue;
+
+        for (const item of stored) {
+          if (!item?.preview) continue;
+
+          try {
+            let parsed =
+              typeof item.preview === "string"
+                ? JSON.parse(item.preview)
+                : item.preview;
+
+            // Normalize object → array
+            if (!Array.isArray(parsed) && typeof parsed === "object") {
+              parsed = [parsed];
+            }
+
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              table = parsed;
+            }
+          } catch {
+            console.warn("Parse failed:", item.preview);
+          }
+        }
+      }
+    }
+
+    // 4️⃣ Fallback
+    if (!text && !table) {
+      text = "⚠️ No readable response received.";
+    }
+
+    return { text, table };
   }
-}
+
 
 
   async function sendMessage() {
@@ -166,26 +220,21 @@ export default function App() {
         return;
       }
 
-      let botText = data?.text || "No response received";
+      const { text, table } = parseDaemoResponse(data);
 
-      if (data?.toolInteractions?.length) {
-        const lastTool =
-          data.toolInteractions[data.toolInteractions.length - 1];
-
-        if (Array.isArray(lastTool?.result)) {
-          setTableData(lastTool.result);
-          setShowTable(false);
-          botText += "\n\nInventory data retrieved. Click below to view details.";
-        }
-      }
 
       const botMessage: Message = {
         role: "bot",
-        text: botText,
+        text: text,
         timestamp: new Date(),
       };
 
       setMessages((prev) => [...prev, botMessage]);
+
+      if (table) {
+        setTableData(table);
+        setShowTable(false);
+      }
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -843,56 +892,56 @@ export default function App() {
           <h1>Inventory Assistant</h1>
         </div>
         <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
-  <button
-    className="refresh-button"
-    onClick={wakeServer}
-    disabled={serverStatus === "checking"}
-  >
-    {serverStatus === "checking"
-      ? "Waking..."
-      : serverStatus === "online"
-      ? "Server Online"
-      : serverStatus === "offline"
-      ? "Server Offline"
-      : "Wake Server"}
-  </button>
+          <button
+            className="refresh-button"
+            onClick={wakeServer}
+            disabled={serverStatus === "checking"}
+          >
+            {serverStatus === "checking"
+              ? "Waking..."
+              : serverStatus === "online"
+                ? "Server Online"
+                : serverStatus === "offline"
+                  ? "Server Offline"
+                  : "Wake Server"}
+          </button>
 
-  <div
-    className="status"
-    style={{
-      background:
-        serverStatus === "online"
-          ? "var(--success-light)"
-          : serverStatus === "offline"
-          ? "var(--error-light)"
-          : "var(--border-light)",
-      color:
-        serverStatus === "online"
-          ? "var(--success)"
-          : serverStatus === "offline"
-          ? "var(--error)"
-          : "var(--text-secondary)",
-    }}
-  >
-    <div
-      className="status-dot"
-      style={{
-        background:
-          serverStatus === "online"
-            ? "var(--success)"
-            : serverStatus === "offline"
-            ? "var(--error)"
-            : "var(--text-tertiary)",
-      }}
-    ></div>
+          <div
+            className="status"
+            style={{
+              background:
+                serverStatus === "online"
+                  ? "var(--success-light)"
+                  : serverStatus === "offline"
+                    ? "var(--error-light)"
+                    : "var(--border-light)",
+              color:
+                serverStatus === "online"
+                  ? "var(--success)"
+                  : serverStatus === "offline"
+                    ? "var(--error)"
+                    : "var(--text-secondary)",
+            }}
+          >
+            <div
+              className="status-dot"
+              style={{
+                background:
+                  serverStatus === "online"
+                    ? "var(--success)"
+                    : serverStatus === "offline"
+                      ? "var(--error)"
+                      : "var(--text-tertiary)",
+              }}
+            ></div>
 
-    {serverStatus === "online"
-      ? "Online"
-      : serverStatus === "offline"
-      ? "Offline"
-      : "Unknown"}
-  </div>
-</div>
+            {serverStatus === "online"
+              ? "Online"
+              : serverStatus === "offline"
+                ? "Offline"
+                : "Unknown"}
+          </div>
+        </div>
 
       </div>
 
@@ -1015,7 +1064,7 @@ export default function App() {
         <div className="panel">
           <div className="panel-header">
             <div className="panel-title">Live Inventory Data</div>
-            <button 
+            <button
               className="refresh-button"
               onClick={fetchGoogleSheetData}
               disabled={sheetLoading}
@@ -1035,7 +1084,7 @@ export default function App() {
                 <div className="error-icon">!</div>
                 <div className="error-title">Unable to Load Data</div>
                 <div className="error-message">{sheetError}</div>
-                <button 
+                <button
                   className="refresh-button"
                   onClick={fetchGoogleSheetData}
                   style={{ marginTop: '8px' }}
