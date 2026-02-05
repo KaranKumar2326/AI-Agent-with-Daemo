@@ -1,14 +1,19 @@
 import { useState, useRef, useEffect } from "react";
+import ReactMarkdown from 'react-markdown';
 
 const AGENT_ID = import.meta.env.VITE_DAEMO_AGENT_ID;
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL;
-
 const API_KEY = import.meta.env.VITE_DAEMO_API_KEY;
 const GOOGLE_SHEET_ID = "10nSkephAlzBd4qDkPTBfx6C1zVRJGRrWNiKtHBq47jw";
 
+type MessageContent = {
+  type: 'text' | 'table' | 'jsx' | 'markdown' | 'card' | 'error';
+  data: any;
+};
+
 type Message = {
   role: "user" | "bot";
-  text: string;
+  content: MessageContent[];
   timestamp: Date;
 };
 
@@ -16,8 +21,6 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [tableData, setTableData] = useState<any[]>([]);
-  const [showTable, setShowTable] = useState(false);
   const [sheetData, setSheetData] = useState<any[]>([]);
   const [sheetLoading, setSheetLoading] = useState(false);
   const [sheetError, setSheetError] = useState<string | null>(null);
@@ -27,16 +30,12 @@ export default function App() {
     "idle" | "checking" | "online" | "offline"
   >("idle");
 
-
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
   useEffect(() => {
     wakeServer();
-  }, []);
-
-
-  useEffect(() => {
     fetchGoogleSheetData();
   }, []);
 
@@ -45,25 +44,21 @@ export default function App() {
     setSheetError(null);
 
     try {
-      // Using published CSV format (works if sheet is published to web)
       const csvUrl = `https://docs.google.com/spreadsheets/d/${GOOGLE_SHEET_ID}/export?format=csv&gid=0`;
-
       const response = await fetch(csvUrl);
 
       if (!response.ok) {
-        throw new Error("Failed to fetch sheet data. Make sure the sheet is published to the web (File → Share → Publish to web).");
+        throw new Error("Failed to fetch sheet data. Make sure the sheet is published to the web.");
       }
 
       const csvText = await response.text();
       const rows = csvText.split("\n").map(row => {
-        // Handle CSV parsing with proper quote handling
         const values: string[] = [];
         let current = "";
         let inQuotes = false;
 
         for (let i = 0; i < row.length; i++) {
           const char = row[i];
-
           if (char === '"') {
             inQuotes = !inQuotes;
           } else if (char === "," && !inQuotes) {
@@ -74,7 +69,6 @@ export default function App() {
           }
         }
         values.push(current.trim());
-
         return values;
       });
 
@@ -87,7 +81,6 @@ export default function App() {
           });
           return obj;
         });
-
         setSheetData(data);
       }
     } catch (error) {
@@ -98,21 +91,13 @@ export default function App() {
     }
   }
 
-
   async function wakeServer() {
     try {
       setServerStatus("checking");
-
       const res = await fetch(`${BACKEND_URL}/`);
-
-      if (!res.ok) {
-        throw new Error("Server not responding");
-      }
-
+      if (!res.ok) throw new Error("Server not responding");
       const data = await res.json();
-
       console.log("✅ Server health:", data);
-
       setServerStatus("online");
     } catch (err) {
       console.error("❌ Wake failed:", err);
@@ -120,67 +105,139 @@ export default function App() {
     }
   }
 
-  function parseDaemoResponse(data: any) {
-    let text = "";
-    let table: any[] | null = null;
+  function parseJSXContent(jsx: string): any {
+    // Extract structured data from JSX if possible
+    try {
+      // Look for common patterns in the JSX
+      const cardPattern = /<Card>[\s\S]*?<\/Card>/g;
+      const matches = jsx.match(cardPattern);
 
-    // 1️⃣ Text response
+      if (matches) {
+        const cards = matches.map(card => {
+          const titleMatch = card.match(/<CardTitle>(.*?)<\/CardTitle>/);
+          const descMatch = card.match(/<CardDescription>(.*?)<\/CardDescription>/);
+          const contentMatch = card.match(/<CardContent>([\s\S]*?)<\/CardContent>/);
+
+          let fields: any = {};
+          let value = '';
+          let subtitle = '';
+
+          if (contentMatch) {
+            const content = contentMatch[1];
+
+            // Look for field patterns: <p><strong>Field:</strong> Value</p>
+            const fieldMatches = content.matchAll(/<p><strong>(.*?):<\/strong>\s*(.*?)<\/p>/g);
+            for (const match of fieldMatches) {
+              fields[match[1]] = match[2];
+            }
+
+            // Look for large value pattern: <p className="text-3xl...">Value</p>
+            const valueMatch = content.match(/<p className="text-3xl[^"]*">(.*?)<\/p>/);
+            if (valueMatch) {
+              value = valueMatch[1];
+            }
+
+            // Look for subtitle pattern: <p className="text-sm...">Subtitle</p>
+            const subtitleMatch = content.match(/<p className="text-sm[^"]*">(.*?)<\/p>/);
+            if (subtitleMatch) {
+              subtitle = subtitleMatch[1];
+            }
+          }
+
+          return {
+            title: titleMatch ? titleMatch[1].replace(/[💰💵📦📊⚠️🚫]/g, '').trim() : '',
+            description: descMatch ? descMatch[1] : '',
+            fields,
+            value,
+            subtitle
+          };
+        }).filter(card => card.title || card.value); // Only keep cards with content
+
+        return cards;
+      }
+    } catch (e) {
+      console.warn("Failed to parse JSX:", e);
+    }
+
+    return null;
+  }
+
+  function parseDaemoResponse(data: any): MessageContent[] {
+    const contents: MessageContent[] = [];
+
+    // 1. Handle direct text response (highest priority)
     if (data?.text) {
-      text = data.text;
+      contents.push({
+        type: 'text',
+        data: data.text
+      });
     }
 
-    // 2️⃣ JSX fallback
-    else if (data?.jsx) {
-      text = "📊 Data loaded. See table below.";
+    // 2. Handle JSX response
+    if (data?.jsx) {
+      const parsedCards = parseJSXContent(data.jsx);
+      if (parsedCards) {
+        contents.push({
+          type: 'card',
+          data: parsedCards
+        });
+      }
     }
 
-    // 3️⃣ Tool interactions
-    if (Array.isArray(data?.toolInteractions)) {
+    // 3. Handle tool interactions and stored data (only if no text response exists)
+    if (!data?.text && Array.isArray(data?.toolInteractions)) {
       for (const tool of data.toolInteractions) {
         const stored = tool?.result?.stored;
 
-        if (!Array.isArray(stored)) continue;
+        if (Array.isArray(stored)) {
+          for (const item of stored) {
+            if (item?.preview) {
+              try {
+                let parsed = typeof item.preview === "string"
+                  ? JSON.parse(item.preview)
+                  : item.preview;
 
-        for (const item of stored) {
-          if (!item?.preview) continue;
+                // Normalize single objects to arrays
+                if (!Array.isArray(parsed) && typeof parsed === "object") {
+                  parsed = [parsed];
+                }
 
-          try {
-            let parsed =
-              typeof item.preview === "string"
-                ? JSON.parse(item.preview)
-                : item.preview;
-
-            // Normalize object → array
-            if (!Array.isArray(parsed) && typeof parsed === "object") {
-              parsed = [parsed];
+                // If it's an array of objects, treat as table
+                if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === "object") {
+                  contents.push({
+                    type: 'table',
+                    data: {
+                      title: item.var_name || 'Data',
+                      rows: parsed
+                    }
+                  });
+                }
+              } catch (e) {
+                console.warn("Failed to parse preview:", e);
+              }
             }
-
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              table = parsed;
-            }
-          } catch {
-            console.warn("Parse failed:", item.preview);
           }
         }
       }
     }
 
-    // 4️⃣ Fallback
-    if (!text && !table) {
-      text = "⚠️ No readable response received.";
+    // 4. If no content was parsed, show error
+    if (contents.length === 0) {
+      contents.push({
+        type: 'error',
+        data: 'No readable response received from the assistant.'
+      });
     }
 
-    return { text, table };
+    return contents;
   }
-
-
 
   async function sendMessage() {
     if (!input.trim() || loading) return;
 
     const userMessage: Message = {
       role: "user",
-      text: input,
+      content: [{ type: 'text', data: input }],
       timestamp: new Date(),
     };
 
@@ -189,17 +246,15 @@ export default function App() {
     setLoading(true);
 
     try {
-      const url = `https://backend.daemo.ai/agents/${AGENT_ID}/query`;
-
+      // const url = `https://backend.daemo.ai/agents/${AGENT_ID}/query`;
+      const url = `${BACKEND_URL}/agent/query-stream`
       const res = await fetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "X-API-Key": API_KEY,
         },
-        body: JSON.stringify({
-          query: userMessage.text,
-        }),
+        body: JSON.stringify({ query: userMessage.content[0].data }),
       });
 
       const rawText = await res.text();
@@ -212,7 +267,7 @@ export default function App() {
           ...prev,
           {
             role: "bot",
-            text: "Unable to process server response. Please try again.",
+            content: [{ type: 'error', data: 'Unable to process server response. Please try again.' }],
             timestamp: new Date(),
           },
         ]);
@@ -220,27 +275,21 @@ export default function App() {
         return;
       }
 
-      const { text, table } = parseDaemoResponse(data);
-
+      const parsedContent = parseDaemoResponse(data);
 
       const botMessage: Message = {
         role: "bot",
-        text: text,
+        content: parsedContent,
         timestamp: new Date(),
       };
 
       setMessages((prev) => [...prev, botMessage]);
-
-      if (table) {
-        setTableData(table);
-        setShowTable(false);
-      }
     } catch (err) {
       setMessages((prev) => [
         ...prev,
         {
           role: "bot",
-          text: "Connection error. Please check your network and try again.",
+          content: [{ type: 'error', data: 'Connection error. Please check your network and try again.' }],
           timestamp: new Date(),
         },
       ]);
@@ -254,6 +303,106 @@ export default function App() {
       hour: "numeric",
       minute: "2-digit",
     });
+  }
+
+  function renderContent(content: MessageContent) {
+    switch (content.type) {
+      case 'text':
+        return <div className="message-text">{content.data}</div>;
+
+      case 'markdown':
+        return (
+          <div className="message-markdown">
+            <ReactMarkdown>{content.data}</ReactMarkdown>
+          </div>
+        );
+
+      case 'table':
+        return (
+          <div className="message-table">
+            <div className="table-header">
+              <div className="table-title">{content.data.title}</div>
+              <div className="table-count">
+                {content.data.rows.length} {content.data.rows.length === 1 ? 'item' : 'items'}
+              </div>
+            </div>
+            <div className="table-wrapper">
+              <table>
+                <thead>
+                  <tr>
+                    {Object.keys(content.data.rows[0]).map((col) => (
+                      <th key={col}>{col}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {content.data.rows.map((row: any, i: number) => (
+                    <tr key={i}>
+                      {Object.keys(content.data.rows[0]).map((col) => (
+                        <td key={col}>{String(row[col])}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+
+      case 'card':
+        return (
+          <div className="message-cards">
+            {content.data.map((card: any, i: number) => (
+              <div key={i} className="info-card">
+                {card.title && <div className="card-title">{card.title}</div>}
+                {card.description && <div className="card-description">{card.description}</div>}
+
+                {/* Large value display */}
+                {card.value && (
+                  <div className="card-value-large">
+                    {card.value}
+                  </div>
+                )}
+
+                {/* Subtitle under value */}
+                {card.subtitle && (
+                  <div className="card-subtitle">{card.subtitle}</div>
+                )}
+
+                {/* Field/value pairs */}
+                {Object.keys(card.fields).length > 0 && (
+                  <div className="card-fields">
+                    {Object.entries(card.fields).map(([key, value]) => (
+                      <div key={key} className="card-field">
+                        <span className="field-label">{key}:</span>
+                        <span className="field-value">{String(value)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        );
+
+      case 'jsx':
+        return (
+          <div className="message-code">
+            <pre><code>{content.data}</code></pre>
+          </div>
+        );
+
+      case 'error':
+        return (
+          <div className="message-error">
+            <span className="error-icon">⚠️</span>
+            {content.data}
+          </div>
+        );
+
+      default:
+        return <div className="message-text">{JSON.stringify(content.data)}</div>;
+    }
   }
 
   return (
@@ -468,7 +617,7 @@ export default function App() {
         .message-group {
           display: flex;
           flex-direction: column;
-          gap: 6px;
+          gap: 12px;
           animation: slideIn 0.3s ease-out;
         }
 
@@ -514,27 +663,249 @@ export default function App() {
 
         .message {
           max-width: 85%;
-          padding: 14px 18px;
           border-radius: var(--radius);
-          white-space: pre-wrap;
-          line-height: 1.6;
-          font-size: 14px;
           position: relative;
           transition: all 0.2s ease;
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
         }
 
         .message.user {
           background: var(--accent);
           color: white;
+          padding: 14px 18px;
           border-bottom-right-radius: 4px;
           box-shadow: var(--shadow);
         }
 
         .message.bot {
+          width: 100%;
+          max-width: 100%;
+        }
+
+        .message-text {
+          padding: 14px 18px;
           background: var(--background);
-          color: var(--text-primary);
           border: 1px solid var(--border);
-          border-bottom-left-radius: 4px;
+          border-radius: var(--radius);
+          line-height: 1.6;
+          font-size: 14px;
+          white-space: pre-wrap;
+        }
+
+        .message-markdown {
+          padding: 14px 18px;
+          background: var(--background);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          line-height: 1.6;
+          font-size: 14px;
+        }
+
+        .message-markdown pre {
+          background: var(--primary);
+          color: #e2e8f0;
+          padding: 12px;
+          border-radius: var(--radius-sm);
+          overflow-x: auto;
+          margin: 8px 0;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 13px;
+        }
+
+        .message-markdown code {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 13px;
+        }
+
+        .message-markdown p {
+          margin: 8px 0;
+        }
+
+        .message-markdown strong {
+          color: var(--text-primary);
+          font-weight: 600;
+        }
+
+        .message-table {
+          background: var(--surface);
+          border-radius: var(--radius);
+          border: 1px solid var(--border);
+          overflow: hidden;
+          box-shadow: var(--shadow);
+          width: 100%;
+        }
+
+        .table-header {
+          padding: 12px 16px;
+          background: linear-gradient(to right, var(--primary), var(--primary-light));
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+        }
+
+        .table-title {
+          font-size: 14px;
+          font-weight: 600;
+          color: white;
+          letter-spacing: -0.01em;
+        }
+
+        .table-count {
+          font-size: 11px;
+          color: rgba(255, 255, 255, 0.7);
+          font-weight: 500;
+        }
+
+        .table-wrapper {
+          overflow-x: auto;
+          max-height: 400px;
+          overflow-y: auto;
+        }
+
+        table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+
+        th {
+          background: var(--background);
+          padding: 10px 14px;
+          text-align: left;
+          font-size: 11px;
+          font-weight: 600;
+          color: var(--text-secondary);
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          border-bottom: 2px solid var(--border);
+          position: sticky;
+          top: 0;
+          z-index: 10;
+        }
+
+        td {
+          padding: 10px 14px;
+          font-size: 13px;
+          color: var(--text-primary);
+          border-bottom: 1px solid var(--border-light);
+          font-family: 'JetBrains Mono', monospace;
+        }
+
+        tr:last-child td {
+          border-bottom: none;
+        }
+
+        tbody tr {
+          transition: background 0.15s ease;
+        }
+
+        tbody tr:hover {
+          background: var(--background);
+        }
+
+        .message-cards {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+          gap: 12px;
+          width: 100%;
+        }
+
+        .info-card {
+          background: var(--surface);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          padding: 16px;
+          box-shadow: var(--shadow-sm);
+          transition: all 0.2s ease;
+        }
+
+        .info-card:hover {
+          box-shadow: var(--shadow);
+          border-color: var(--accent);
+        }
+
+        .card-title {
+          font-size: 16px;
+          font-weight: 600;
+          color: var(--text-primary);
+          margin-bottom: 6px;
+        }
+
+        .card-description {
+          font-size: 13px;
+          color: var(--text-secondary);
+          margin-bottom: 12px;
+          line-height: 1.5;
+        }
+
+        .card-value-large {
+          font-size: 32px;
+          font-weight: 700;
+          color: var(--accent);
+          margin: 12px 0 4px 0;
+          font-family: 'JetBrains Mono', monospace;
+        }
+
+        .card-subtitle {
+          font-size: 12px;
+          color: var(--text-tertiary);
+          margin-bottom: 12px;
+        }
+
+        .card-fields {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+
+        .card-field {
+          display: flex;
+          gap: 8px;
+          font-size: 13px;
+          line-height: 1.5;
+        }
+
+        .field-label {
+          font-weight: 600;
+          color: var(--text-secondary);
+          min-width: 120px;
+        }
+
+        .field-value {
+          color: var(--text-primary);
+          font-family: 'JetBrains Mono', monospace;
+        }
+
+        .message-code {
+          background: var(--primary);
+          border-radius: var(--radius);
+          padding: 14px;
+          overflow-x: auto;
+        }
+
+        .message-code pre {
+          margin: 0;
+          color: #e2e8f0;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 12px;
+          line-height: 1.6;
+        }
+
+        .message-error {
+          padding: 14px 18px;
+          background: var(--error-light);
+          border: 1px solid var(--error);
+          border-radius: var(--radius);
+          color: var(--error);
+          font-size: 14px;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+
+        .error-icon {
+          font-size: 18px;
         }
 
         .typing-indicator {
@@ -574,110 +945,6 @@ export default function App() {
           font-size: 13px;
           color: var(--text-secondary);
           font-weight: 500;
-        }
-
-        .table-button {
-          align-self: center;
-          padding: 12px 24px;
-          background: var(--success);
-          color: white;
-          border: none;
-          border-radius: var(--radius);
-          cursor: pointer;
-          font-family: 'Outfit', sans-serif;
-          font-size: 14px;
-          font-weight: 600;
-          transition: all 0.2s ease;
-          box-shadow: var(--shadow);
-          margin: 12px 0;
-        }
-
-        .table-button:hover {
-          background: #059669;
-          transform: translateY(-1px);
-          box-shadow: var(--shadow-lg);
-        }
-
-        .table-button:active {
-          transform: translateY(0);
-        }
-
-        .table-container {
-          width: 100%;
-          background: var(--surface);
-          border-radius: var(--radius-lg);
-          border: 1px solid var(--border);
-          overflow: hidden;
-          box-shadow: var(--shadow);
-          animation: slideIn 0.3s ease-out;
-          margin: 12px 0;
-        }
-
-        .table-header {
-          padding: 16px 20px;
-          background: linear-gradient(to right, var(--primary), var(--primary-light));
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-        }
-
-        .table-title {
-          font-size: 16px;
-          font-weight: 600;
-          color: white;
-          letter-spacing: -0.01em;
-        }
-
-        .table-count {
-          font-size: 12px;
-          color: rgba(255, 255, 255, 0.7);
-          font-weight: 500;
-        }
-
-        .table-wrapper {
-          overflow-x: auto;
-          max-height: 400px;
-          overflow-y: auto;
-        }
-
-        table {
-          width: 100%;
-          border-collapse: collapse;
-        }
-
-        th {
-          background: var(--background);
-          padding: 12px 16px;
-          text-align: left;
-          font-size: 12px;
-          font-weight: 600;
-          color: var(--text-secondary);
-          text-transform: uppercase;
-          letter-spacing: 0.05em;
-          border-bottom: 2px solid var(--border);
-          position: sticky;
-          top: 0;
-          z-index: 10;
-        }
-
-        td {
-          padding: 12px 16px;
-          font-size: 13px;
-          color: var(--text-primary);
-          border-bottom: 1px solid var(--border-light);
-          font-family: 'JetBrains Mono', monospace;
-        }
-
-        tr:last-child td {
-          border-bottom: none;
-        }
-
-        tbody tr {
-          transition: background 0.15s ease;
-        }
-
-        tbody tr:hover {
-          background: var(--background);
         }
 
         .input-container {
@@ -833,7 +1100,7 @@ export default function App() {
           padding: 48px;
         }
 
-        .error-icon {
+        .error-icon-large {
           width: 64px;
           height: 64px;
           background: var(--error-light);
@@ -942,7 +1209,6 @@ export default function App() {
                 : "Unknown"}
           </div>
         </div>
-
       </div>
 
       <div className="main-content">
@@ -972,49 +1238,13 @@ export default function App() {
                       </span>
                       <span className="message-time">{formatTime(m.timestamp)}</span>
                     </div>
-                    <div className={`message ${m.role}`}>{m.text}</div>
+                    <div className={`message ${m.role}`}>
+                      {m.content.map((content, idx) => (
+                        <div key={idx}>{renderContent(content)}</div>
+                      ))}
+                    </div>
                   </div>
                 ))}
-
-                {tableData.length > 0 && !showTable && (
-                  <button
-                    className="table-button"
-                    onClick={() => setShowTable(true)}
-                  >
-                    View Inventory Table
-                  </button>
-                )}
-
-                {showTable && tableData.length > 0 && (
-                  <div className="table-container">
-                    <div className="table-header">
-                      <div className="table-title">Inventory Data</div>
-                      <div className="table-count">
-                        {tableData.length} {tableData.length === 1 ? "item" : "items"}
-                      </div>
-                    </div>
-                    <div className="table-wrapper">
-                      <table>
-                        <thead>
-                          <tr>
-                            {Object.keys(tableData[0]).map((col) => (
-                              <th key={col}>{col}</th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {tableData.map((row, i) => (
-                            <tr key={i}>
-                              {Object.keys(tableData[0]).map((col) => (
-                                <td key={col}>{row[col]}</td>
-                              ))}
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                )}
 
                 {loading && (
                   <div className="message-group bot">
@@ -1081,7 +1311,7 @@ export default function App() {
               </div>
             ) : sheetError ? (
               <div className="sheet-error">
-                <div className="error-icon">!</div>
+                <div className="error-icon-large">!</div>
                 <div className="error-title">Unable to Load Data</div>
                 <div className="error-message">{sheetError}</div>
                 <button
