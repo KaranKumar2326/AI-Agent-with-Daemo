@@ -14,8 +14,19 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+app.options("*", cors());
 
 app.use(bodyParser.json());
+
+
+const ensureDaemo = async (req: any, res: any, next: any) => {
+  try {
+    await initDaemo();
+    next();
+  } catch (err) {
+    res.status(500).json({ error: "Daemo engine failed to initialize" });
+  }
+};
 
 /**
  * Health + Wake Route
@@ -42,8 +53,8 @@ app.get("/", async (req, res) => {
 /**
  * API Routes
  */
-app.post("/agent/query", agentController.processQuery);
-app.post("/agent/query-stream", agentController.processQueryStreamed);
+app.post("/agent/query", ensureDaemo, agentController.processQuery);
+app.post("/agent/query-stream", ensureDaemo, agentController.processQueryStreamed);
 
 app.listen(PORT, () => {
   console.log(`🚀 API running on port ${PORT}`);

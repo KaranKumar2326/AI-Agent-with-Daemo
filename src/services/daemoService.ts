@@ -4,33 +4,37 @@ import {
   DaemoHostedConnection,
   SessionData,
 } from "daemo-engine";
-
 import { InventoryService } from "./InventoryService";
 import { config } from "../config";
 
 let sessionData: SessionData | null = null;
 let connection: DaemoHostedConnection | null = null;
-
 let connecting = false;
 
 /**
  * Initialize / Reconnect Daemo
+ * @param force - If true, ignores existing connection and recreates it
  */
-export async function initDaemo() {
+export async function initDaemo(force = false) {
   if (connecting) {
     console.log("⏳ Daemo connection in progress...");
     return;
   }
 
-  if (connection) {
+  // If already connected and not forcing a refresh, skip
+  if (connection && !force) {
     return;
   }
 
   connecting = true;
 
-  console.log("🔌 Initializing Daemo...");
-
   try {
+    if (force) {
+      console.log("🔄 Force-resetting Daemo connection...");
+      resetDaemo();
+    }
+
+    console.log("🔌 Initializing Daemo...");
     const inventoryService = new InventoryService();
 
     const session = new DaemoBuilder()
@@ -250,7 +254,7 @@ Every response MUST follow this sequence:
 4️⃣ Never reference past interactions
 
 You are a stateless function executor. Each user message is treated as completely independent.
-`)
+`) // Keep your existing prompt here
       .registerService(inventoryService)
       .build();
 
@@ -265,14 +269,10 @@ You are a stateless function executor. Each user message is treated as completel
     await connection.start();
 
     sessionData = session;
-
     console.log("✅ Daemo Connected");
   } catch (err) {
     console.error("❌ Daemo Connection Failed:", err);
-
-    connection = null;
-    sessionData = null;
-
+    resetDaemo();
     throw err;
   } finally {
     connecting = false;
@@ -283,8 +283,7 @@ You are a stateless function executor. Each user message is treated as completel
  * Reset Dead Connection
  */
 export function resetDaemo() {
-  console.warn("🔄 Resetting Daemo connection");
-
+  console.warn("🔄 Resetting Daemo variables");
   connection = null;
   sessionData = null;
 }
