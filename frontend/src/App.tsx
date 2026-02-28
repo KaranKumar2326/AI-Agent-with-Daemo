@@ -1,1065 +1,915 @@
-import { useState, useRef, useEffect } from "react";
-import ReactMarkdown from 'react-markdown';
+import { useState, useRef, useEffect, useCallback } from "react";
 
+// ─── ENV CONFIG ───────────────────────────────────────────────────────────────
 const AGENT_ID = import.meta.env.VITE_DAEMO_AGENT_ID;
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL;
 const API_KEY = import.meta.env.VITE_DAEMO_API_KEY;
 const GOOGLE_SHEET_ID = "10nSkephAlzBd4qDkPTBfx6C1zVRJGRrWNiKtHBq47jw";
 
-type MessageContent = {
-  type: 'text' | 'table' | 'jsx' | 'markdown' | 'card' | 'error';
-  data: any;
-};
-
+// ─── TYPES ────────────────────────────────────────────────────────────────────
 type Message = {
+  id: string;
   role: "user" | "bot";
-  content: MessageContent[];
+  text: string;
   timestamp: Date;
+  table?: any[] | null;
+  status?: "ok" | "error" | "warning";
 };
 
+type ServerStatus = "idle" | "checking" | "online" | "offline";
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+/** Safely parse a preview string that may be JSON or a JS object literal */
+function safeParsePreview(preview: unknown): any {
+  if (preview === null || preview === undefined) return null;
+  if (typeof preview === "object") return preview;
+  if (typeof preview !== "string") return null;
+
+  const str = preview.trim();
+  if (!str || str === "[]" || str === "{}") return null;
+
+  // Try standard JSON first
+  try {
+    return JSON.parse(str);
+  } catch {
+    // no-op
+  }
+
+  // Fall back to JS object literal (trusted internal API only)
+  try {
+    // eslint-disable-next-line no-new-func
+    return Function('"use strict"; return (' + str + ')')();
+  } catch {
+    return null;
+  }
+}
+
+/** Keys that indicate a summary/meta object rather than tabular row data */
+const SUMMARY_KEYS = new Set([
+  "totalProducts", "totalQuantity", "totalValue",
+  "lowStockCount", "outOfStockCount", "executionTime",
+  "meta", "status", "error", "functionsUsed",
+]);
+
+function isSummaryObject(obj: Record<string, unknown>): boolean {
+  const keys = Object.keys(obj);
+  return keys.length > 0 && keys.every(k => SUMMARY_KEYS.has(k));
+}
+
+/** Normalize any parsed value into a table-ready array or null */
+function normalizeToTable(parsed: any): any[] | null {
+  if (parsed === null || parsed === undefined) return null;
+
+  // Empty array
+  if (Array.isArray(parsed)) {
+    if (parsed.length === 0) return null;
+    // Filter out non-object elements
+    const rows = parsed.filter(r => r && typeof r === "object");
+    return rows.length > 0 ? rows : null;
+  }
+
+  if (typeof parsed !== "object") return null;
+
+  // Unwrap { meta, ...rest } — strip meta field
+  const { meta, ...rest } = parsed as any;
+
+  if (Object.keys(rest).length === 0) return null;
+
+  // If it looks like a summary, still show it as a single-row table
+  // (the caller decides whether to use it as text or table)
+  return [rest];
+}
+
+/** Extract readable text from a Daemo JSX string */
+function extractTextFromJSX(jsx: string): string {
+  const lines: string[] = [];
+
+  // Main CardTitle (first one = page heading)
+  const titles = [...jsx.matchAll(/<CardTitle[^>]*>([\s\S]*?)<\/CardTitle>/g)];
+  const descriptions = [...jsx.matchAll(/<CardDescription[^>]*>([\s\S]*?)<\/CardDescription>/g)];
+  const paragraphs = [...jsx.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/g)];
+  const boldDivs = [...jsx.matchAll(/<div[^>]*font-bold[^>]*>([\s\S]*?)<\/div>/g)];
+
+  const stripTags = (s: string) => s.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+
+  if (titles.length > 0) {
+    lines.push(stripTags(titles[0][1]));
+  }
+
+  // Pair sub-card titles with their bold values
+  const subTitles = titles.slice(1).map(m => stripTags(m[1]));
+  const boldValues = boldDivs.map(m => stripTags(m[1]));
+
+  subTitles.forEach((title, i) => {
+    const val = boldValues[i];
+    if (val) lines.push(`${title}: ${val}`);
+    else lines.push(title);
+  });
+
+  // Descriptions and paragraphs
+  [...descriptions, ...paragraphs].forEach(m => {
+    const t = stripTags(m[1]);
+    if (t && !lines.some(l => l.includes(t.slice(0, 30)))) {
+      lines.push(t);
+    }
+  });
+
+  if (lines.length > 0) return lines.join("\n");
+
+  // Hard fallback: strip all tags
+  return jsx.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/** Main response parser — returns { text, table } */
+function parseDaemoResponse(data: any): { text: string; table: any[] | null } {
+  let text = "";
+  let table: any[] | null = null;
+
+  // ── 1. Plain text ──────────────────────────────────────────────────────────
+  if (typeof data?.text === "string" && data.text.trim()) {
+    text = data.text.trim();
+  }
+  // ── 2. JSX ─────────────────────────────────────────────────────────────────
+  else if (typeof data?.jsx === "string" && data.jsx.trim()) {
+    text = extractTextFromJSX(data.jsx);
+  }
+
+  // ── 3. Tool interactions → table data ──────────────────────────────────────
+  if (Array.isArray(data?.toolInteractions)) {
+    // Iterate all tool calls; prefer the last one that yields a good table
+    for (const tool of data.toolInteractions) {
+      const stored: any[] | undefined = tool?.result?.stored;
+
+      if (Array.isArray(stored)) {
+        for (const item of stored) {
+          if (!item?.preview) continue;
+
+          const parsed = safeParsePreview(item.preview);
+          if (parsed === null) continue;
+
+          const normalized = normalizeToTable(parsed);
+          if (normalized && normalized.length > 0) {
+            // Prefer actual row data over summary objects
+            const firstRow = normalized[0];
+            if (typeof firstRow === "object" && !isSummaryObject(firstRow)) {
+              table = normalized;
+            } else if (!table) {
+              // Fallback: use summary as table if nothing better found
+              table = normalized;
+            }
+          }
+        }
+      }
+
+      // Also check direct result object
+      const result = tool?.result?.result;
+      if (!table && result && typeof result === "object" && !result?.error) {
+        const { meta, ...clean } = result as any;
+        if (Object.keys(clean).length > 0) {
+          table = [clean];
+        }
+      }
+    }
+  }
+
+  // ── 4. Final text fallback ─────────────────────────────────────────────────
+  if (!text && table) {
+    text = `Found ${table.length} result${table.length !== 1 ? "s" : ""}. See table below.`;
+  } else if (!text) {
+    text = "⚠️ No readable response received.";
+  }
+
+  return { text, table };
+}
+
+/** Parse CSV text into array of objects */
+function parseCSV(csvText: string): any[] {
+  const rows = csvText.split("\n").map(row => {
+    const values: string[] = [];
+    let current = "";
+    let inQuotes = false;
+
+    for (let i = 0; i < row.length; i++) {
+      const char = row[i];
+      if (char === '"') {
+        inQuotes = !inQuotes;
+      } else if (char === "," && !inQuotes) {
+        values.push(current.trim());
+        current = "";
+      } else {
+        current += char;
+      }
+    }
+    values.push(current.trim());
+    return values;
+  });
+
+  if (rows.length < 2) return [];
+
+  const headers = rows[0].map(h => h.replace(/^\uFEFF/, "").trim()); // strip BOM
+  return rows
+    .slice(1)
+    .filter(row => row.some(cell => cell.trim()))
+    .map(row => {
+      const obj: any = {};
+      headers.forEach((header, index) => {
+        obj[header] = row[index] ?? "";
+      });
+      return obj;
+    });
+}
+
+/** Generate a unique message ID */
+function genId(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+// ─── COMPONENT ────────────────────────────────────────────────────────────────
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
+
   const [sheetData, setSheetData] = useState<any[]>([]);
   const [sheetLoading, setSheetLoading] = useState(false);
   const [sheetError, setSheetError] = useState<string | null>(null);
+
+  const [serverStatus, setServerStatus] = useState<ServerStatus>("idle");
+
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const [serverStatus, setServerStatus] = useState<
-    "idle" | "checking" | "online" | "offline"
-  >("idle");
 
+  // Auto-scroll
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, expandedTables]);
 
+  // On mount
   useEffect(() => {
     wakeServer();
     fetchGoogleSheetData();
   }, []);
 
-  async function fetchGoogleSheetData() {
-    setSheetLoading(true);
-    setSheetError(null);
-
-    try {
-      const csvUrl = `https://docs.google.com/spreadsheets/d/${GOOGLE_SHEET_ID}/export?format=csv&gid=0`;
-      const response = await fetch(csvUrl);
-
-      if (!response.ok) {
-        throw new Error("Failed to fetch sheet data. Make sure the sheet is published to the web.");
-      }
-
-      const csvText = await response.text();
-      const rows = csvText.split("\n").map(row => {
-        const values: string[] = [];
-        let current = "";
-        let inQuotes = false;
-
-        for (let i = 0; i < row.length; i++) {
-          const char = row[i];
-          if (char === '"') {
-            inQuotes = !inQuotes;
-          } else if (char === "," && !inQuotes) {
-            values.push(current.trim());
-            current = "";
-          } else {
-            current += char;
-          }
-        }
-        values.push(current.trim());
-        return values;
-      });
-
-      if (rows.length > 1) {
-        const headers = rows[0];
-        const data = rows.slice(1).filter(row => row.some(cell => cell)).map(row => {
-          const obj: any = {};
-          headers.forEach((header, index) => {
-            obj[header] = row[index] || "";
-          });
-          return obj;
-        });
-        setSheetData(data);
-      }
-    } catch (error) {
-      console.error("Error fetching Google Sheet:", error);
-      setSheetError(error instanceof Error ? error.message : "Failed to load sheet data");
-    } finally {
-      setSheetLoading(false);
-    }
-  }
-
+  // ── Server health ────────────────────────────────────────────────────────
   async function wakeServer() {
+    setServerStatus("checking");
     try {
-      setServerStatus("checking");
-      const res = await fetch(`${BACKEND_URL}/`);
-      if (!res.ok) throw new Error("Server not responding");
-      const data = await res.json();
-      console.log("✅ Server health:", data);
+      const res = await fetch(`${BACKEND_URL}/`, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) throw new Error("Non-OK response");
       setServerStatus("online");
-    } catch (err) {
-      console.error("❌ Wake failed:", err);
+    } catch {
       setServerStatus("offline");
     }
   }
 
-  function parseJSXContent(jsx: string): any {
-    // Extract structured data from JSX if possible
+  // ── Google Sheet fetch ───────────────────────────────────────────────────
+  const fetchGoogleSheetData = useCallback(async () => {
+    setSheetLoading(true);
+    setSheetError(null);
     try {
-      // Look for common patterns in the JSX
-      const cardPattern = /<Card>[\s\S]*?<\/Card>/g;
-      const matches = jsx.match(cardPattern);
-
-      if (matches) {
-        const cards = matches.map(card => {
-          const titleMatch = card.match(/<CardTitle>(.*?)<\/CardTitle>/);
-          const descMatch = card.match(/<CardDescription>(.*?)<\/CardDescription>/);
-          const contentMatch = card.match(/<CardContent>([\s\S]*?)<\/CardContent>/);
-
-          let fields: any = {};
-          let value = '';
-          let subtitle = '';
-
-          if (contentMatch) {
-            const content = contentMatch[1];
-
-            // Look for field patterns: <p><strong>Field:</strong> Value</p>
-            const fieldMatches = content.matchAll(/<p><strong>(.*?):<\/strong>\s*(.*?)<\/p>/g);
-            for (const match of fieldMatches) {
-              fields[match[1]] = match[2];
-            }
-
-            // Look for large value pattern: <p className="text-3xl...">Value</p>
-            const valueMatch = content.match(/<p className="text-3xl[^"]*">(.*?)<\/p>/);
-            if (valueMatch) {
-              value = valueMatch[1];
-            }
-
-            // Look for subtitle pattern: <p className="text-sm...">Subtitle</p>
-            const subtitleMatch = content.match(/<p className="text-sm[^"]*">(.*?)<\/p>/);
-            if (subtitleMatch) {
-              subtitle = subtitleMatch[1];
-            }
-          }
-
-          return {
-            title: titleMatch ? titleMatch[1].replace(/[💰💵📦📊⚠️🚫]/g, '').trim() : '',
-            description: descMatch ? descMatch[1] : '',
-            fields,
-            value,
-            subtitle
-          };
-        }).filter(card => card.title || card.value); // Only keep cards with content
-
-        return cards;
+      const csvUrl = `https://docs.google.com/spreadsheets/d/${GOOGLE_SHEET_ID}/export?format=csv&gid=0`;
+      const response = await fetch(csvUrl, { signal: AbortSignal.timeout(10000) });
+      if (!response.ok) {
+        throw new Error(
+          "Failed to fetch sheet data. Make sure the sheet is published to the web (File → Share → Publish to web)."
+        );
       }
-    } catch (e) {
-      console.warn("Failed to parse JSX:", e);
+      const csvText = await response.text();
+      const data = parseCSV(csvText);
+      setSheetData(data);
+    } catch (error) {
+      setSheetError(error instanceof Error ? error.message : "Failed to load sheet data");
+    } finally {
+      setSheetLoading(false);
     }
+  }, []);
 
-    return null;
+  // ── Toggle table expansion per message ──────────────────────────────────
+  function toggleTable(id: string) {
+    setExpandedTables(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
   }
 
-  function parseDaemoResponse(data: any): MessageContent[] {
-    const contents: MessageContent[] = [];
-
-    // 1. Handle direct text response (highest priority)
-    if (data?.text) {
-      contents.push({
-        type: 'text',
-        data: data.text
-      });
-    }
-
-    // 2. Handle JSX response
-    if (data?.jsx) {
-      const parsedCards = parseJSXContent(data.jsx);
-      if (parsedCards) {
-        contents.push({
-          type: 'card',
-          data: parsedCards
-        });
-      }
-    }
-
-    // 3. Handle tool interactions and stored data (only if no text response exists)
-    if (!data?.text && Array.isArray(data?.toolInteractions)) {
-      for (const tool of data.toolInteractions) {
-        const stored = tool?.result?.stored;
-
-        if (Array.isArray(stored)) {
-          for (const item of stored) {
-            if (item?.preview) {
-              try {
-                let parsed = typeof item.preview === "string"
-                  ? JSON.parse(item.preview)
-                  : item.preview;
-
-                // Normalize single objects to arrays
-                if (!Array.isArray(parsed) && typeof parsed === "object") {
-                  parsed = [parsed];
-                }
-
-                // If it's an array of objects, treat as table
-                if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === "object") {
-                  contents.push({
-                    type: 'table',
-                    data: {
-                      title: item.var_name || 'Data',
-                      rows: parsed
-                    }
-                  });
-                }
-              } catch (e) {
-                console.warn("Failed to parse preview:", e);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // 4. If no content was parsed, show error
-    if (contents.length === 0) {
-      contents.push({
-        type: 'error',
-        data: 'No readable response received from the assistant.'
-      });
-    }
-
-    return contents;
-  }
-
+  // ── Send message ─────────────────────────────────────────────────────────
   async function sendMessage() {
-    if (!input.trim() || loading) return;
+    const query = input.trim();
+    if (!query || loading) return;
 
-    const userMessage: Message = {
+    const userMsg: Message = {
+      id: genId(),
       role: "user",
-      content: [{ type: 'text', data: input }],
+      text: query,
       timestamp: new Date(),
     };
 
-    setMessages((prev) => [...prev, userMessage]);
+    setMessages(prev => [...prev, userMsg]);
     setInput("");
     setLoading(true);
 
     try {
-      // const url = `https://backend.daemo.ai/agents/${AGENT_ID}/query`;
-      const url = `${BACKEND_URL}/agent/query-stream`
+      const url = `https://backend.daemo.ai/agents/${AGENT_ID}/query`;
+
       const res = await fetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "X-API-Key": API_KEY,
         },
-        body: JSON.stringify({ query: userMessage.content[0].data }),
+        body: JSON.stringify({ query }),
+        signal: AbortSignal.timeout(30000),
       });
 
-      const rawText = await res.text();
-      let data: any;
-
-      try {
-        data = JSON.parse(rawText);
-      } catch (err) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "bot",
-            content: [{ type: 'error', data: 'Unable to process server response. Please try again.' }],
-            timestamp: new Date(),
-          },
-        ]);
-        setLoading(false);
-        return;
+      if (!res.ok) {
+        throw new Error(`Server responded with status ${res.status}`);
       }
 
-      const parsedContent = parseDaemoResponse(data);
+      const rawText = await res.text();
 
-      const botMessage: Message = {
+      let data: any;
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        throw new Error("Invalid JSON response from server");
+      }
+
+      const { text, table } = parseDaemoResponse(data);
+
+      const botMsg: Message = {
+        id: genId(),
         role: "bot",
-        content: parsedContent,
+        text,
         timestamp: new Date(),
+        table: table,
+        status: "ok",
       };
 
-      setMessages((prev) => [...prev, botMessage]);
-    } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "bot",
-          content: [{ type: 'error', data: 'Connection error. Please check your network and try again.' }],
-          timestamp: new Date(),
-        },
-      ]);
+      setMessages(prev => [...prev, botMsg]);
+    } catch (err: any) {
+      const isTimeout = err?.name === "TimeoutError" || err?.name === "AbortError";
+      const botMsg: Message = {
+        id: genId(),
+        role: "bot",
+        text: isTimeout
+          ? "⏱ Request timed out. The server may be starting up — please try again."
+          : err?.message
+            ? `Error: ${err.message}`
+            : "Connection error. Please check your network and try again.",
+        timestamp: new Date(),
+        status: "error",
+      };
+      setMessages(prev => [...prev, botMsg]);
+    } finally {
+      setLoading(false);
     }
-
-    setLoading(false);
   }
 
   function formatTime(date: Date) {
-    return date.toLocaleTimeString("en-US", {
-      hour: "numeric",
-      minute: "2-digit",
-    });
+    return date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
   }
 
-  function renderContent(content: MessageContent) {
-    switch (content.type) {
-      case 'text':
-        return <div className="message-text">{content.data}</div>;
-
-      case 'markdown':
-        return (
-          <div className="message-markdown">
-            <ReactMarkdown>{content.data}</ReactMarkdown>
-          </div>
-        );
-
-      case 'table':
-        return (
-          <div className="message-table">
-            <div className="table-header">
-              <div className="table-title">{content.data.title}</div>
-              <div className="table-count">
-                {content.data.rows.length} {content.data.rows.length === 1 ? 'item' : 'items'}
-              </div>
-            </div>
-            <div className="table-wrapper">
-              <table>
-                <thead>
-                  <tr>
-                    {Object.keys(content.data.rows[0]).map((col) => (
-                      <th key={col}>{col}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {content.data.rows.map((row: any, i: number) => (
-                    <tr key={i}>
-                      {Object.keys(content.data.rows[0]).map((col) => (
-                        <td key={col}>{String(row[col])}</td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        );
-
-      case 'card':
-        return (
-          <div className="message-cards">
-            {content.data.map((card: any, i: number) => (
-              <div key={i} className="info-card">
-                {card.title && <div className="card-title">{card.title}</div>}
-                {card.description && <div className="card-description">{card.description}</div>}
-
-                {/* Large value display */}
-                {card.value && (
-                  <div className="card-value-large">
-                    {card.value}
-                  </div>
-                )}
-
-                {/* Subtitle under value */}
-                {card.subtitle && (
-                  <div className="card-subtitle">{card.subtitle}</div>
-                )}
-
-                {/* Field/value pairs */}
-                {Object.keys(card.fields).length > 0 && (
-                  <div className="card-fields">
-                    {Object.entries(card.fields).map(([key, value]) => (
-                      <div key={key} className="card-field">
-                        <span className="field-label">{key}:</span>
-                        <span className="field-value">{String(value)}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        );
-
-      case 'jsx':
-        return (
-          <div className="message-code">
-            <pre><code>{content.data}</code></pre>
-          </div>
-        );
-
-      case 'error':
-        return (
-          <div className="message-error">
-            <span className="error-icon">⚠️</span>
-            {content.data}
-          </div>
-        );
-
-      default:
-        return <div className="message-text">{JSON.stringify(content.data)}</div>;
-    }
-  }
-
+  // ─── RENDER ────────────────────────────────────────────────────────────────
   return (
     <div className="app">
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Mono:wght@400;500&display=swap');
 
-        * {
-          margin: 0;
-          padding: 0;
-          box-sizing: border-box;
-        }
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
         :root {
-          --primary: #0F172A;
-          --primary-light: #1E293B;
-          --primary-lighter: #334155;
-          --accent: #3B82F6;
-          --accent-hover: #2563EB;
-          --accent-light: #DBEAFE;
-          --background: #F8FAFC;
-          --surface: #FFFFFF;
-          --text-primary: #0F172A;
-          --text-secondary: #64748B;
-          --text-tertiary: #94A3B8;
-          --border: #E2E8F0;
-          --border-light: #F1F5F9;
-          --success: #10B981;
-          --success-light: #D1FAE5;
-          --warning: #F59E0B;
-          --warning-light: #FEF3C7;
-          --error: #EF4444;
-          --error-light: #FEE2E2;
-          --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-          --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-          --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
-          --radius: 12px;
-          --radius-sm: 8px;
-          --radius-lg: 16px;
+          --bg:         #0C0E12;
+          --surface:    #13161D;
+          --surface2:   #1A1E27;
+          --surface3:   #222733;
+          --border:     #2A2F3E;
+          --border2:    #333848;
+          --accent:     #4F8EF7;
+          --accent2:    #6FFFB0;
+          --accent3:    #FF6B6B;
+          --text1:      #EEF0F6;
+          --text2:      #8B92A8;
+          --text3:      #555D72;
+          --radius:     10px;
+          --radius-lg:  16px;
+          --shadow:     0 4px 24px rgba(0,0,0,0.4);
+          --shadow-lg:  0 12px 40px rgba(0,0,0,0.5);
+          --font:       'Syne', sans-serif;
+          --mono:       'DM Mono', monospace;
         }
 
         body {
-          font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
-          background: var(--background);
-          color: var(--text-primary);
+          font-family: var(--font);
+          background: var(--bg);
+          color: var(--text1);
           -webkit-font-smoothing: antialiased;
-          -moz-osx-font-smoothing: grayscale;
         }
 
         .app {
           height: 100vh;
           display: flex;
           flex-direction: column;
-          background: var(--background);
+          overflow: hidden;
         }
 
+        /* ── HEADER ── */
         .header {
           background: var(--surface);
-          padding: 20px 32px;
           border-bottom: 1px solid var(--border);
+          padding: 0 28px;
+          height: 60px;
           display: flex;
           align-items: center;
           justify-content: space-between;
+          flex-shrink: 0;
           position: relative;
-          z-index: 10;
+          z-index: 20;
         }
 
-        .header::after {
-          content: '';
-          position: absolute;
-          bottom: 0;
-          left: 32px;
-          right: 32px;
-          height: 2px;
-          background: linear-gradient(90deg, var(--accent) 0%, transparent 100%);
-          opacity: 0.6;
-        }
-
-        .header-content {
+        .header-left {
           display: flex;
           align-items: center;
-          gap: 16px;
+          gap: 12px;
         }
 
-        .logo {
-          width: 40px;
-          height: 40px;
-          background: linear-gradient(135deg, var(--accent) 0%, #8B5CF6 100%);
-          border-radius: var(--radius-sm);
+        .logo-mark {
+          width: 34px;
+          height: 34px;
+          background: linear-gradient(135deg, var(--accent), var(--accent2));
+          border-radius: 8px;
           display: flex;
           align-items: center;
           justify-content: center;
-          font-weight: 700;
-          color: white;
-          font-size: 18px;
+          font-size: 15px;
+          font-weight: 800;
+          color: var(--bg);
+          letter-spacing: -1px;
+          flex-shrink: 0;
         }
 
         .header h1 {
-          font-size: 22px;
-          font-weight: 600;
-          letter-spacing: -0.02em;
-          color: var(--text-primary);
-        }
-
-        .status {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          padding: 8px 16px;
-          background: var(--success-light);
-          border-radius: 100px;
-          font-size: 13px;
-          font-weight: 500;
-          color: var(--success);
-        }
-
-        .status-dot {
-          width: 6px;
-          height: 6px;
-          background: var(--success);
-          border-radius: 50%;
-          animation: pulse 2s ease-in-out infinite;
-        }
-
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.5; }
-        }
-
-        .main-content {
-          flex: 1;
-          display: grid;
-          grid-template-columns: 1fr 1fr;
-          gap: 1px;
-          background: var(--border);
-          overflow: hidden;
-        }
-
-        .panel {
-          background: var(--surface);
-          display: flex;
-          flex-direction: column;
-          overflow: hidden;
-        }
-
-        .panel-header {
-          padding: 16px 24px;
-          border-bottom: 1px solid var(--border);
-          background: var(--background);
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-        }
-
-        .panel-title {
-          font-size: 15px;
-          font-weight: 600;
-          color: var(--text-secondary);
-          text-transform: uppercase;
-          letter-spacing: 0.05em;
-        }
-
-        .refresh-button {
-          padding: 6px 12px;
-          background: transparent;
-          border: 1px solid var(--border);
-          border-radius: var(--radius-sm);
-          color: var(--text-secondary);
-          font-size: 13px;
-          font-weight: 500;
-          cursor: pointer;
-          transition: all 0.2s ease;
-          font-family: 'Outfit', sans-serif;
-        }
-
-        .refresh-button:hover {
-          background: var(--background);
-          border-color: var(--accent);
-          color: var(--accent);
-        }
-
-        .chat-container {
-          flex: 1;
-          overflow-y: auto;
-          padding: 24px;
-          display: flex;
-          flex-direction: column;
-          gap: 20px;
-        }
-
-        .chat-container::-webkit-scrollbar,
-        .sheet-container::-webkit-scrollbar {
-          width: 8px;
-        }
-
-        .chat-container::-webkit-scrollbar-track,
-        .sheet-container::-webkit-scrollbar-track {
-          background: transparent;
-        }
-
-        .chat-container::-webkit-scrollbar-thumb,
-        .sheet-container::-webkit-scrollbar-thumb {
-          background: var(--border);
-          border-radius: 100px;
-        }
-
-        .chat-container::-webkit-scrollbar-thumb:hover,
-        .sheet-container::-webkit-scrollbar-thumb:hover {
-          background: var(--text-tertiary);
-        }
-
-        .message-group {
-          display: flex;
-          flex-direction: column;
-          gap: 12px;
-          animation: slideIn 0.3s ease-out;
-        }
-
-        @keyframes slideIn {
-          from {
-            opacity: 0;
-            transform: translateY(10px);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0);
-          }
-        }
-
-        .message-group.user {
-          align-items: flex-end;
-        }
-
-        .message-group.bot {
-          align-items: flex-start;
-        }
-
-        .message-header {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          padding: 0 4px;
-        }
-
-        .message-role {
-          font-size: 12px;
-          font-weight: 600;
-          color: var(--text-secondary);
-          text-transform: uppercase;
-          letter-spacing: 0.05em;
-        }
-
-        .message-time {
-          font-size: 11px;
-          color: var(--text-tertiary);
-          font-weight: 400;
-        }
-
-        .message {
-          max-width: 85%;
-          border-radius: var(--radius);
-          position: relative;
-          transition: all 0.2s ease;
-          display: flex;
-          flex-direction: column;
-          gap: 12px;
-        }
-
-        .message.user {
-          background: var(--accent);
-          color: white;
-          padding: 14px 18px;
-          border-bottom-right-radius: 4px;
-          box-shadow: var(--shadow);
-        }
-
-        .message.bot {
-          width: 100%;
-          max-width: 100%;
-        }
-
-        .message-text {
-          padding: 14px 18px;
-          background: var(--background);
-          border: 1px solid var(--border);
-          border-radius: var(--radius);
-          line-height: 1.6;
-          font-size: 14px;
-          white-space: pre-wrap;
-        }
-
-        .message-markdown {
-          padding: 14px 18px;
-          background: var(--background);
-          border: 1px solid var(--border);
-          border-radius: var(--radius);
-          line-height: 1.6;
-          font-size: 14px;
-        }
-
-        .message-markdown pre {
-          background: var(--primary);
-          color: #e2e8f0;
-          padding: 12px;
-          border-radius: var(--radius-sm);
-          overflow-x: auto;
-          margin: 8px 0;
-          font-family: 'JetBrains Mono', monospace;
-          font-size: 13px;
-        }
-
-        .message-markdown code {
-          font-family: 'JetBrains Mono', monospace;
-          font-size: 13px;
-        }
-
-        .message-markdown p {
-          margin: 8px 0;
-        }
-
-        .message-markdown strong {
-          color: var(--text-primary);
-          font-weight: 600;
-        }
-
-        .message-table {
-          background: var(--surface);
-          border-radius: var(--radius);
-          border: 1px solid var(--border);
-          overflow: hidden;
-          box-shadow: var(--shadow);
-          width: 100%;
-        }
-
-        .table-header {
-          padding: 12px 16px;
-          background: linear-gradient(to right, var(--primary), var(--primary-light));
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-        }
-
-        .table-title {
-          font-size: 14px;
-          font-weight: 600;
-          color: white;
-          letter-spacing: -0.01em;
-        }
-
-        .table-count {
-          font-size: 11px;
-          color: rgba(255, 255, 255, 0.7);
-          font-weight: 500;
-        }
-
-        .table-wrapper {
-          overflow-x: auto;
-          max-height: 400px;
-          overflow-y: auto;
-        }
-
-        table {
-          width: 100%;
-          border-collapse: collapse;
-        }
-
-        th {
-          background: var(--background);
-          padding: 10px 14px;
-          text-align: left;
-          font-size: 11px;
-          font-weight: 600;
-          color: var(--text-secondary);
-          text-transform: uppercase;
-          letter-spacing: 0.05em;
-          border-bottom: 2px solid var(--border);
-          position: sticky;
-          top: 0;
-          z-index: 10;
-        }
-
-        td {
-          padding: 10px 14px;
-          font-size: 13px;
-          color: var(--text-primary);
-          border-bottom: 1px solid var(--border-light);
-          font-family: 'JetBrains Mono', monospace;
-        }
-
-        tr:last-child td {
-          border-bottom: none;
-        }
-
-        tbody tr {
-          transition: background 0.15s ease;
-        }
-
-        tbody tr:hover {
-          background: var(--background);
-        }
-
-        .message-cards {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-          gap: 12px;
-          width: 100%;
-        }
-
-        .info-card {
-          background: var(--surface);
-          border: 1px solid var(--border);
-          border-radius: var(--radius);
-          padding: 16px;
-          box-shadow: var(--shadow-sm);
-          transition: all 0.2s ease;
-        }
-
-        .info-card:hover {
-          box-shadow: var(--shadow);
-          border-color: var(--accent);
-        }
-
-        .card-title {
           font-size: 16px;
-          font-weight: 600;
-          color: var(--text-primary);
-          margin-bottom: 6px;
-        }
-
-        .card-description {
-          font-size: 13px;
-          color: var(--text-secondary);
-          margin-bottom: 12px;
-          line-height: 1.5;
-        }
-
-        .card-value-large {
-          font-size: 32px;
           font-weight: 700;
-          color: var(--accent);
-          margin: 12px 0 4px 0;
-          font-family: 'JetBrains Mono', monospace;
+          color: var(--text1);
+          letter-spacing: -0.02em;
         }
 
-        .card-subtitle {
-          font-size: 12px;
-          color: var(--text-tertiary);
-          margin-bottom: 12px;
-        }
-
-        .card-fields {
-          display: flex;
-          flex-direction: column;
-          gap: 8px;
-        }
-
-        .card-field {
-          display: flex;
-          gap: 8px;
-          font-size: 13px;
-          line-height: 1.5;
-        }
-
-        .field-label {
-          font-weight: 600;
-          color: var(--text-secondary);
-          min-width: 120px;
-        }
-
-        .field-value {
-          color: var(--text-primary);
-          font-family: 'JetBrains Mono', monospace;
-        }
-
-        .message-code {
-          background: var(--primary);
-          border-radius: var(--radius);
-          padding: 14px;
-          overflow-x: auto;
-        }
-
-        .message-code pre {
-          margin: 0;
-          color: #e2e8f0;
-          font-family: 'JetBrains Mono', monospace;
-          font-size: 12px;
-          line-height: 1.6;
-        }
-
-        .message-error {
-          padding: 14px 18px;
-          background: var(--error-light);
-          border: 1px solid var(--error);
-          border-radius: var(--radius);
-          color: var(--error);
-          font-size: 14px;
+        .header-right {
           display: flex;
           align-items: center;
           gap: 10px;
         }
 
-        .error-icon {
-          font-size: 18px;
+        .server-btn {
+          padding: 6px 14px;
+          background: var(--surface2);
+          border: 1px solid var(--border2);
+          border-radius: var(--radius);
+          color: var(--text2);
+          font-size: 12px;
+          font-weight: 600;
+          font-family: var(--font);
+          cursor: pointer;
+          transition: all 0.18s ease;
+          letter-spacing: 0.01em;
         }
 
-        .typing-indicator {
+        .server-btn:hover:not(:disabled) {
+          border-color: var(--accent);
+          color: var(--accent);
+        }
+
+        .server-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .status-pill {
           display: flex;
           align-items: center;
-          gap: 12px;
-          padding: 14px 18px;
-          background: var(--background);
-          border: 1px solid var(--border);
-          border-radius: var(--radius);
-          max-width: fit-content;
-        }
-
-        .typing-dots {
-          display: flex;
-          gap: 6px;
-        }
-
-        .typing-dot {
-          width: 7px;
-          height: 7px;
-          background: var(--text-tertiary);
-          border-radius: 50%;
-          animation: typing 1.4s ease-in-out infinite;
-        }
-
-        .typing-dot:nth-child(1) { animation-delay: 0s; }
-        .typing-dot:nth-child(2) { animation-delay: 0.2s; }
-        .typing-dot:nth-child(3) { animation-delay: 0.4s; }
-
-        @keyframes typing {
-          0%, 60%, 100% { transform: translateY(0); opacity: 0.6; }
-          30% { transform: translateY(-8px); opacity: 1; }
-        }
-
-        .typing-text {
-          font-size: 13px;
-          color: var(--text-secondary);
-          font-weight: 500;
-        }
-
-        .input-container {
-          padding: 20px 24px;
-          background: var(--surface);
-          border-top: 1px solid var(--border);
-          display: flex;
-          gap: 12px;
-          align-items: flex-end;
-        }
-
-        .input-wrapper {
-          flex: 1;
-          position: relative;
-        }
-
-        .input {
-          width: 100%;
-          padding: 14px 18px;
-          font-size: 14px;
-          border: 2px solid var(--border);
-          border-radius: var(--radius);
-          font-family: 'Outfit', sans-serif;
-          background: var(--surface);
-          color: var(--text-primary);
-          transition: all 0.2s ease;
-          resize: none;
-          line-height: 1.5;
-        }
-
-        .input:focus {
-          outline: none;
-          border-color: var(--accent);
-          box-shadow: 0 0 0 4px var(--accent-light);
-        }
-
-        .input::placeholder {
-          color: var(--text-tertiary);
-        }
-
-        .send-button {
-          padding: 14px 28px;
-          background: var(--accent);
-          color: white;
-          border: none;
-          border-radius: var(--radius);
-          cursor: pointer;
-          font-family: 'Outfit', sans-serif;
-          font-size: 14px;
+          gap: 7px;
+          padding: 5px 12px;
+          border-radius: 100px;
+          font-size: 12px;
           font-weight: 600;
-          transition: all 0.2s ease;
-          box-shadow: var(--shadow);
+          letter-spacing: 0.02em;
+          transition: all 0.3s ease;
         }
 
-        .send-button:hover:not(:disabled) {
-          background: var(--accent-hover);
-          transform: translateY(-1px);
-          box-shadow: var(--shadow-lg);
+        .status-dot {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
         }
 
-        .send-button:active:not(:disabled) {
-          transform: translateY(0);
+        .status-dot.pulse {
+          animation: statusPulse 2s ease-in-out infinite;
         }
 
-        .send-button:disabled {
-          opacity: 0.5;
-          cursor: not-allowed;
+        @keyframes statusPulse {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.5; transform: scale(0.8); }
         }
 
+        /* ── MAIN LAYOUT ── */
+        .main-content {
+          flex: 1;
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          overflow: hidden;
+          gap: 0;
+        }
+
+        .panel {
+          display: flex;
+          flex-direction: column;
+          overflow: hidden;
+          border-right: 1px solid var(--border);
+        }
+
+        .panel:last-child { border-right: none; }
+
+        .panel-header {
+          padding: 12px 20px;
+          border-bottom: 1px solid var(--border);
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          background: var(--surface);
+          flex-shrink: 0;
+        }
+
+        .panel-label {
+          font-size: 11px;
+          font-weight: 700;
+          color: var(--text3);
+          text-transform: uppercase;
+          letter-spacing: 0.1em;
+        }
+
+        .refresh-btn {
+          padding: 5px 12px;
+          background: transparent;
+          border: 1px solid var(--border2);
+          border-radius: 6px;
+          color: var(--text2);
+          font-size: 11px;
+          font-weight: 600;
+          font-family: var(--font);
+          cursor: pointer;
+          transition: all 0.18s;
+          letter-spacing: 0.03em;
+        }
+
+        .refresh-btn:hover:not(:disabled) {
+          border-color: var(--accent);
+          color: var(--accent);
+        }
+
+        .refresh-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        /* ── CHAT ── */
+        .chat-scroll {
+          flex: 1;
+          overflow-y: auto;
+          padding: 20px;
+          display: flex;
+          flex-direction: column;
+          gap: 16px;
+          background: var(--bg);
+        }
+
+        .chat-scroll::-webkit-scrollbar { width: 4px; }
+        .chat-scroll::-webkit-scrollbar-track { background: transparent; }
+        .chat-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+
+        /* ── EMPTY STATE ── */
         .empty-state {
           flex: 1;
           display: flex;
           flex-direction: column;
           align-items: center;
           justify-content: center;
-          gap: 12px;
-          color: var(--text-tertiary);
+          gap: 10px;
           padding: 40px;
+          animation: fadeIn 0.4s ease;
         }
 
         .empty-icon {
-          width: 64px;
-          height: 64px;
-          background: linear-gradient(135deg, var(--accent-light) 0%, var(--border-light) 100%);
-          border-radius: 50%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 28px;
-          margin-bottom: 8px;
+          font-size: 36px;
+          margin-bottom: 4px;
+          opacity: 0.6;
         }
 
         .empty-title {
-          font-size: 17px;
-          font-weight: 600;
-          color: var(--text-secondary);
+          font-size: 15px;
+          font-weight: 700;
+          color: var(--text2);
         }
 
-        .empty-description {
-          font-size: 14px;
-          color: var(--text-tertiary);
+        .empty-desc {
+          font-size: 13px;
+          color: var(--text3);
           text-align: center;
-          max-width: 350px;
-          line-height: 1.5;
+          max-width: 280px;
+          line-height: 1.6;
         }
 
-        .sheet-container {
+        @keyframes fadeIn {
+          from { opacity: 0; transform: translateY(8px); }
+          to   { opacity: 1; transform: translateY(0); }
+        }
+
+        /* ── MESSAGE GROUP ── */
+        .msg-group {
+          display: flex;
+          flex-direction: column;
+          gap: 5px;
+          animation: msgIn 0.25s ease-out;
+        }
+
+        @keyframes msgIn {
+          from { opacity: 0; transform: translateY(6px); }
+          to   { opacity: 1; transform: translateY(0); }
+        }
+
+        .msg-group.user { align-items: flex-end; }
+        .msg-group.bot  { align-items: flex-start; }
+
+        .msg-meta {
+          display: flex;
+          align-items: center;
+          gap: 7px;
+          padding: 0 3px;
+        }
+
+        .msg-role {
+          font-size: 11px;
+          font-weight: 700;
+          color: var(--text3);
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+        }
+
+        .msg-time {
+          font-size: 11px;
+          color: var(--text3);
+          font-family: var(--mono);
+        }
+
+        .msg-bubble {
+          max-width: 88%;
+          padding: 12px 16px;
+          border-radius: var(--radius-lg);
+          font-size: 13.5px;
+          line-height: 1.65;
+          white-space: pre-wrap;
+          word-break: break-word;
+        }
+
+        .msg-bubble.user {
+          background: var(--accent);
+          color: #fff;
+          border-bottom-right-radius: 4px;
+          box-shadow: 0 2px 12px rgba(79,142,247,0.25);
+        }
+
+        .msg-bubble.bot {
+          background: var(--surface2);
+          color: var(--text1);
+          border: 1px solid var(--border);
+          border-bottom-left-radius: 4px;
+        }
+
+        .msg-bubble.bot.error {
+          background: rgba(255, 107, 107, 0.08);
+          border-color: rgba(255, 107, 107, 0.3);
+          color: #ff9b9b;
+        }
+
+        /* ── TABLE TOGGLE BUTTON ── */
+        .table-toggle-btn {
+          margin-top: 6px;
+          align-self: flex-start;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 8px 16px;
+          background: rgba(111, 255, 176, 0.08);
+          border: 1px solid rgba(111, 255, 176, 0.25);
+          border-radius: var(--radius);
+          color: var(--accent2);
+          font-size: 12px;
+          font-weight: 700;
+          font-family: var(--font);
+          cursor: pointer;
+          transition: all 0.18s;
+          letter-spacing: 0.02em;
+        }
+
+        .table-toggle-btn:hover {
+          background: rgba(111, 255, 176, 0.14);
+          border-color: rgba(111, 255, 176, 0.45);
+          transform: translateY(-1px);
+        }
+
+        .table-toggle-btn .arrow {
+          font-size: 10px;
+          transition: transform 0.2s;
+        }
+
+        .table-toggle-btn.open .arrow { transform: rotate(180deg); }
+
+        /* ── INLINE TABLE ── */
+        .inline-table-wrap {
+          margin-top: 8px;
+          width: 100%;
+          max-width: 100%;
+          background: var(--surface2);
+          border: 1px solid var(--border2);
+          border-radius: var(--radius-lg);
+          overflow: hidden;
+          box-shadow: var(--shadow);
+          animation: msgIn 0.2s ease-out;
+        }
+
+        .inline-table-header {
+          padding: 10px 16px;
+          background: var(--surface3);
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          border-bottom: 1px solid var(--border);
+        }
+
+        .inline-table-title {
+          font-size: 12px;
+          font-weight: 700;
+          color: var(--text2);
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+        }
+
+        .inline-table-count {
+          font-size: 11px;
+          font-family: var(--mono);
+          color: var(--accent2);
+          background: rgba(111,255,176,0.1);
+          padding: 2px 8px;
+          border-radius: 20px;
+        }
+
+        .inline-table-scroll {
+          overflow-x: auto;
+          max-height: 320px;
+          overflow-y: auto;
+        }
+
+        .inline-table-scroll::-webkit-scrollbar { height: 4px; width: 4px; }
+        .inline-table-scroll::-webkit-scrollbar-track { background: transparent; }
+        .inline-table-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+
+        .inline-table-scroll table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+
+        .inline-table-scroll th {
+          background: var(--surface3);
+          padding: 9px 14px;
+          font-size: 11px;
+          font-weight: 700;
+          color: var(--text3);
+          text-transform: uppercase;
+          letter-spacing: 0.07em;
+          border-bottom: 1px solid var(--border);
+          white-space: nowrap;
+          position: sticky;
+          top: 0;
+          z-index: 2;
+        }
+
+        .inline-table-scroll td {
+          padding: 9px 14px;
+          font-size: 12px;
+          font-family: var(--mono);
+          color: var(--text1);
+          border-bottom: 1px solid var(--border);
+          white-space: nowrap;
+        }
+
+        .inline-table-scroll tr:last-child td { border-bottom: none; }
+
+        .inline-table-scroll tbody tr:hover { background: var(--surface3); }
+
+        /* ── TYPING INDICATOR ── */
+        .typing-wrap {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 12px 16px;
+          background: var(--surface2);
+          border: 1px solid var(--border);
+          border-radius: var(--radius-lg);
+          border-bottom-left-radius: 4px;
+          width: fit-content;
+        }
+
+        .typing-dots { display: flex; gap: 5px; }
+
+        .typing-dot {
+          width: 6px;
+          height: 6px;
+          background: var(--text3);
+          border-radius: 50%;
+          animation: typingBounce 1.3s ease-in-out infinite;
+        }
+
+        .typing-dot:nth-child(1) { animation-delay: 0s; }
+        .typing-dot:nth-child(2) { animation-delay: 0.18s; }
+        .typing-dot:nth-child(3) { animation-delay: 0.36s; }
+
+        @keyframes typingBounce {
+          0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+          30%            { transform: translateY(-7px); opacity: 1; }
+        }
+
+        .typing-label {
+          font-size: 12px;
+          font-weight: 600;
+          color: var(--text3);
+          letter-spacing: 0.04em;
+        }
+
+        /* ── INPUT ── */
+        .input-bar {
+          padding: 16px 20px;
+          background: var(--surface);
+          border-top: 1px solid var(--border);
+          display: flex;
+          gap: 10px;
+          align-items: center;
+          flex-shrink: 0;
+        }
+
+        .input-field {
+          flex: 1;
+          padding: 12px 16px;
+          font-size: 13.5px;
+          font-family: var(--font);
+          background: var(--surface2);
+          border: 1px solid var(--border2);
+          border-radius: var(--radius);
+          color: var(--text1);
+          transition: border-color 0.18s, box-shadow 0.18s;
+          outline: none;
+        }
+
+        .input-field:focus {
+          border-color: var(--accent);
+          box-shadow: 0 0 0 3px rgba(79,142,247,0.12);
+        }
+
+        .input-field::placeholder { color: var(--text3); }
+        .input-field:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .send-btn {
+          padding: 12px 22px;
+          background: var(--accent);
+          color: #fff;
+          border: none;
+          border-radius: var(--radius);
+          font-size: 13px;
+          font-weight: 700;
+          font-family: var(--font);
+          cursor: pointer;
+          transition: all 0.18s;
+          letter-spacing: 0.02em;
+          flex-shrink: 0;
+          white-space: nowrap;
+        }
+
+        .send-btn:hover:not(:disabled) {
+          background: #3a7ae4;
+          transform: translateY(-1px);
+          box-shadow: 0 4px 14px rgba(79,142,247,0.35);
+        }
+
+        .send-btn:active:not(:disabled) { transform: translateY(0); }
+        .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        /* ── SHEET PANEL ── */
+        .sheet-scroll {
           flex: 1;
           overflow-y: auto;
-          background: var(--background);
+          background: var(--bg);
         }
 
-        .sheet-wrapper {
-          overflow-x: auto;
-        }
+        .sheet-scroll::-webkit-scrollbar { width: 4px; }
+        .sheet-scroll::-webkit-scrollbar-track { background: transparent; }
+        .sheet-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+
+        .sheet-table-wrap { overflow-x: auto; }
 
         .sheet-table {
           width: 100%;
@@ -1067,194 +917,226 @@ export default function App() {
           background: var(--surface);
         }
 
-        .sheet-loading {
+        .sheet-table th {
+          background: var(--surface2);
+          padding: 10px 14px;
+          font-size: 11px;
+          font-weight: 700;
+          color: var(--text3);
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          border-bottom: 2px solid var(--border2);
+          position: sticky;
+          top: 0;
+          z-index: 2;
+          white-space: nowrap;
+        }
+
+        .sheet-table td {
+          padding: 10px 14px;
+          font-size: 12px;
+          font-family: var(--mono);
+          color: var(--text1);
+          border-bottom: 1px solid var(--border);
+          white-space: nowrap;
+        }
+
+        .sheet-table tr:last-child td { border-bottom: none; }
+        .sheet-table tbody tr:hover { background: var(--surface2); }
+
+        /* ── LOADING / ERROR STATES ── */
+        .center-state {
           flex: 1;
           display: flex;
           flex-direction: column;
           align-items: center;
           justify-content: center;
-          gap: 16px;
+          gap: 14px;
           padding: 48px;
+          background: var(--bg);
         }
 
         .spinner {
-          width: 40px;
-          height: 40px;
-          border: 3px solid var(--border);
+          width: 36px;
+          height: 36px;
+          border: 2px solid var(--border2);
           border-top-color: var(--accent);
           border-radius: 50%;
-          animation: spin 0.8s linear infinite;
+          animation: spin 0.7s linear infinite;
         }
 
-        @keyframes spin {
-          to { transform: rotate(360deg); }
-        }
+        @keyframes spin { to { transform: rotate(360deg); } }
 
-        .sheet-error {
-          flex: 1;
-          display: flex;
-          flex-direction: column;
-          align-items: center;
-          justify-content: center;
-          gap: 16px;
-          padding: 48px;
-        }
-
-        .error-icon-large {
-          width: 64px;
-          height: 64px;
-          background: var(--error-light);
-          border-radius: 50%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          color: var(--error);
-          font-size: 28px;
+        .state-title {
+          font-size: 14px;
           font-weight: 700;
+          color: var(--text2);
         }
 
-        .error-title {
-          font-size: 16px;
-          font-weight: 600;
-          color: var(--text-secondary);
-        }
-
-        .error-message {
-          font-size: 13px;
-          color: var(--text-tertiary);
+        .state-desc {
+          font-size: 12px;
+          color: var(--text3);
           text-align: center;
-          max-width: 400px;
-          line-height: 1.5;
+          max-width: 320px;
+          line-height: 1.6;
         }
 
-        @media (max-width: 1024px) {
-          .main-content {
-            grid-template-columns: 1fr;
-          }
-
-          .panel:last-child {
-            display: none;
-          }
+        /* ── RESPONSIVE ── */
+        @media (max-width: 900px) {
+          .main-content { grid-template-columns: 1fr; }
+          .panel:last-child { display: none; }
         }
 
-        @media (max-width: 768px) {
-          .header {
-            padding: 16px 20px;
-          }
-
-          .header h1 {
-            font-size: 18px;
-          }
-
-          .message {
-            max-width: 90%;
-            font-size: 13px;
-          }
+        @media (max-width: 600px) {
+          .header { padding: 0 16px; }
+          .chat-scroll { padding: 14px; }
+          .input-bar { padding: 12px 14px; }
+          .send-btn { padding: 12px 16px; }
         }
       `}</style>
 
-      <div className="header">
-        <div className="header-content">
-          <div className="logo">AI</div>
+      {/* ── HEADER ── */}
+      <header className="header">
+        <div className="header-left">
+          <div className="logo-mark">IN</div>
           <h1>Inventory Assistant</h1>
         </div>
-        <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+        <div className="header-right">
           <button
-            className="refresh-button"
+            className="server-btn"
             onClick={wakeServer}
             disabled={serverStatus === "checking"}
           >
-            {serverStatus === "checking"
-              ? "Waking..."
-              : serverStatus === "online"
-                ? "Server Online"
-                : serverStatus === "offline"
-                  ? "Server Offline"
-                  : "Wake Server"}
+            {serverStatus === "checking" ? "Checking..." :
+              serverStatus === "online" ? "✓ Server Online" :
+                serverStatus === "offline" ? "✗ Offline — Retry" :
+                  "Wake Server"}
           </button>
-
           <div
-            className="status"
+            className="status-pill"
             style={{
-              background:
-                serverStatus === "online"
-                  ? "var(--success-light)"
-                  : serverStatus === "offline"
-                    ? "var(--error-light)"
-                    : "var(--border-light)",
-              color:
-                serverStatus === "online"
-                  ? "var(--success)"
-                  : serverStatus === "offline"
-                    ? "var(--error)"
-                    : "var(--text-secondary)",
+              background: serverStatus === "online" ? "rgba(111,255,176,0.08)" :
+                serverStatus === "offline" ? "rgba(255,107,107,0.08)" :
+                  "rgba(139,146,168,0.08)",
+              color: serverStatus === "online" ? "var(--accent2)" :
+                serverStatus === "offline" ? "var(--accent3)" :
+                  "var(--text2)",
             }}
           >
             <div
-              className="status-dot"
+              className={`status-dot ${serverStatus !== "idle" ? "pulse" : ""}`}
               style={{
-                background:
-                  serverStatus === "online"
-                    ? "var(--success)"
-                    : serverStatus === "offline"
-                      ? "var(--error)"
-                      : "var(--text-tertiary)",
+                background: serverStatus === "online" ? "var(--accent2)" :
+                  serverStatus === "offline" ? "var(--accent3)" :
+                    "var(--text3)",
               }}
-            ></div>
-
-            {serverStatus === "online"
-              ? "Online"
-              : serverStatus === "offline"
-                ? "Offline"
-                : "Unknown"}
+            />
+            {serverStatus === "online" ? "Online" :
+              serverStatus === "offline" ? "Offline" :
+                serverStatus === "checking" ? "Checking" :
+                  "Unknown"}
           </div>
         </div>
-      </div>
+      </header>
 
+      {/* ── MAIN ── */}
       <div className="main-content">
-        {/* Chat Panel */}
+
+        {/* ── CHAT PANEL ── */}
         <div className="panel">
           <div className="panel-header">
-            <div className="panel-title">Chat Assistant</div>
+            <span className="panel-label">Chat Assistant</span>
           </div>
 
-          <div className="chat-container">
+          <div className="chat-scroll">
             {messages.length === 0 ? (
               <div className="empty-state">
                 <div className="empty-icon">💬</div>
                 <div className="empty-title">Start a Conversation</div>
-                <div className="empty-description">
-                  Ask questions about your inventory, request reports, or explore
-                  product details.
+                <div className="empty-desc">
+                  Ask questions about your inventory, request reports, or explore product details.
                 </div>
               </div>
             ) : (
               <>
-                {messages.map((m, i) => (
-                  <div key={i} className={`message-group ${m.role}`}>
-                    <div className="message-header">
-                      <span className="message-role">
-                        {m.role === "user" ? "You" : "Assistant"}
-                      </span>
-                      <span className="message-time">{formatTime(m.timestamp)}</span>
-                    </div>
-                    <div className={`message ${m.role}`}>
-                      {m.content.map((content, idx) => (
-                        <div key={idx}>{renderContent(content)}</div>
-                      ))}
-                    </div>
-                  </div>
-                ))}
+                {messages.map(m => {
+                  const isExpanded = expandedTables.has(m.id);
+                  const hasTable = m.role === "bot" && m.table && m.table.length > 0;
+                  const columns = hasTable ? Object.keys(m.table![0]) : [];
 
-                {loading && (
-                  <div className="message-group bot">
-                    <div className="typing-indicator">
-                      <div className="typing-dots">
-                        <div className="typing-dot"></div>
-                        <div className="typing-dot"></div>
-                        <div className="typing-dot"></div>
+                  return (
+                    <div key={m.id} className={`msg-group ${m.role}`}>
+                      <div className="msg-meta">
+                        <span className="msg-role">{m.role === "user" ? "You" : "Assistant"}</span>
+                        <span className="msg-time">{formatTime(m.timestamp)}</span>
                       </div>
-                      <span className="typing-text">Processing</span>
+
+                      <div className={`msg-bubble ${m.role}${m.status === "error" ? " error" : ""}`}>
+                        {m.text}
+                      </div>
+
+                      {/* Table toggle button */}
+                      {hasTable && (
+                        <button
+                          className={`table-toggle-btn ${isExpanded ? "open" : ""}`}
+                          onClick={() => toggleTable(m.id)}
+                        >
+                          📊 {isExpanded ? "Hide" : "View"} Data Table
+                          <span style={{ fontFamily: "var(--mono)", opacity: 0.7 }}>
+                            ({m.table!.length} {m.table!.length === 1 ? "row" : "rows"})
+                          </span>
+                          <span className="arrow">▼</span>
+                        </button>
+                      )}
+
+                      {/* Inline table */}
+                      {hasTable && isExpanded && (
+                        <div className="inline-table-wrap">
+                          <div className="inline-table-header">
+                            <span className="inline-table-title">Inventory Data</span>
+                            <span className="inline-table-count">
+                              {m.table!.length} {m.table!.length === 1 ? "row" : "rows"}
+                            </span>
+                          </div>
+                          <div className="inline-table-scroll">
+                            <table>
+                              <thead>
+                                <tr>{columns.map(col => <th key={col}>{col}</th>)}</tr>
+                              </thead>
+                              <tbody>
+                                {m.table!.map((row, ri) => (
+                                  <tr key={ri}>
+                                    {columns.map(col => (
+                                      <td key={col}>
+                                        {row[col] === null || row[col] === undefined
+                                          ? "—"
+                                          : String(row[col])}
+                                      </td>
+                                    ))}
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {/* Typing indicator */}
+                {loading && (
+                  <div className="msg-group bot">
+                    <div className="msg-meta">
+                      <span className="msg-role">Assistant</span>
+                    </div>
+                    <div className="typing-wrap">
+                      <div className="typing-dots">
+                        <div className="typing-dot" />
+                        <div className="typing-dot" />
+                        <div className="typing-dot" />
+                      </div>
+                      <span className="typing-label">Processing</span>
                     </div>
                   </div>
                 )}
@@ -1263,71 +1145,67 @@ export default function App() {
             <div ref={chatEndRef} />
           </div>
 
-          <div className="input-container">
-            <div className="input-wrapper">
-              <input
-                ref={inputRef}
-                className="input"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    sendMessage();
-                  }
-                }}
-                placeholder="Ask about inventory..."
-                disabled={loading}
-              />
-            </div>
+          {/* Input bar */}
+          <div className="input-bar">
+            <input
+              ref={inputRef}
+              className="input-field"
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  sendMessage();
+                }
+              }}
+              placeholder="Ask about inventory..."
+              disabled={loading}
+              autoComplete="off"
+            />
             <button
-              className="send-button"
+              className="send-btn"
               onClick={sendMessage}
               disabled={loading || !input.trim()}
             >
-              {loading ? "Sending..." : "Send"}
+              {loading ? "Sending…" : "Send →"}
             </button>
           </div>
         </div>
 
-        {/* Google Sheet Panel */}
+        {/* ── SHEET PANEL ── */}
         <div className="panel">
           <div className="panel-header">
-            <div className="panel-title">Live Inventory Data</div>
+            <span className="panel-label">Live Inventory Data</span>
             <button
-              className="refresh-button"
+              className="refresh-btn"
               onClick={fetchGoogleSheetData}
               disabled={sheetLoading}
             >
-              {sheetLoading ? "Loading..." : "Refresh"}
+              {sheetLoading ? "Loading…" : "↻ Refresh"}
             </button>
           </div>
 
-          <div className="sheet-container">
-            {sheetLoading ? (
-              <div className="sheet-loading">
-                <div className="spinner"></div>
-                <div className="empty-title">Loading sheet data...</div>
-              </div>
-            ) : sheetError ? (
-              <div className="sheet-error">
-                <div className="error-icon-large">!</div>
-                <div className="error-title">Unable to Load Data</div>
-                <div className="error-message">{sheetError}</div>
-                <button
-                  className="refresh-button"
-                  onClick={fetchGoogleSheetData}
-                  style={{ marginTop: '8px' }}
-                >
-                  Try Again
-                </button>
-              </div>
-            ) : sheetData.length > 0 ? (
-              <div className="sheet-wrapper">
+          {sheetLoading ? (
+            <div className="center-state">
+              <div className="spinner" />
+              <div className="state-title">Loading sheet data…</div>
+            </div>
+          ) : sheetError ? (
+            <div className="center-state">
+              <div style={{ fontSize: 32 }}>⚠️</div>
+              <div className="state-title">Unable to Load Data</div>
+              <div className="state-desc">{sheetError}</div>
+              <button className="refresh-btn" onClick={fetchGoogleSheetData}>
+                Try Again
+              </button>
+            </div>
+          ) : sheetData.length > 0 ? (
+            <div className="sheet-scroll">
+              <div className="sheet-table-wrap">
                 <table className="sheet-table">
                   <thead>
                     <tr>
-                      {Object.keys(sheetData[0]).map((col) => (
+                      {Object.keys(sheetData[0]).map(col => (
                         <th key={col}>{col}</th>
                       ))}
                     </tr>
@@ -1335,7 +1213,7 @@ export default function App() {
                   <tbody>
                     {sheetData.map((row, i) => (
                       <tr key={i}>
-                        {Object.keys(sheetData[0]).map((col) => (
+                        {Object.keys(sheetData[0]).map(col => (
                           <td key={col}>{row[col]}</td>
                         ))}
                       </tr>
@@ -1343,16 +1221,16 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
-            ) : (
-              <div className="empty-state">
-                <div className="empty-icon">📊</div>
-                <div className="empty-title">No Data Available</div>
-                <div className="empty-description">
-                  The sheet appears to be empty or could not be loaded.
-                </div>
+            </div>
+          ) : (
+            <div className="center-state">
+              <div style={{ fontSize: 32 }}>📋</div>
+              <div className="state-title">No Data Available</div>
+              <div className="state-desc">
+                The sheet appears to be empty or couldn't be loaded.
               </div>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
